@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
-import { getDb } from "@/lib/mongodb";
+import { getSql, sql } from "@/lib/db";
 import {
-  bootstrapAdmins,
   verifyCredentials,
   signToken,
   verifyToken,
@@ -40,27 +39,7 @@ function requireAuth(req) {
   return payload;
 }
 
-async function getSettings(db) {
-  const s = await db.collection("settings").findOne({ _id: "main" });
-  if (s) return s;
-  const initial = { _id: "main", currentRound: 0 };
-  await db.collection("settings").insertOne(initial);
-  return initial;
-}
-
-async function persistSettings(db, patch) {
-  await db.collection("settings").updateOne(
-    { _id: "main" },
-    { $set: patch },
-    { upsert: true }
-  );
-}
-
-// Multi-level tie-break used by every active-list sort:
-//   1. Higher cumulative total
-//   2. Higher latest scored-round score
-//   3. Higher previous round score
-//   4. Higher competitor number (per spec: lowest competitor number LOSES on tie)
+// Multi-level tie-break: total DESC → latest-scored-round DESC → previous-round DESC → competitor # DESC
 function latestScoredRound(x) {
   for (let r = TOTAL_ROUNDS; r >= 1; r--) {
     if (x.rounds[r] != null) return r;
@@ -85,148 +64,104 @@ function compareForRank(a, b) {
   return b.competitorNumber - a.competitorNumber;
 }
 
+// Build per-athlete rounds map + total from a flat scores array.
+function buildScoresIndex(scores) {
+  const sba = {};
+  for (const s of scores) {
+    if (!sba[s.athlete_id]) sba[s.athlete_id] = {};
+    sba[s.athlete_id][s.round] = Number(s.score);
+  }
+  return sba;
+}
+
+function athleteRow(a, sba) {
+  const rounds = {};
+  let total = 0;
+  for (let r = 1; r <= TOTAL_ROUNDS; r++) {
+    const v = sba[a.id]?.[r];
+    if (typeof v === "number") {
+      rounds[r] = v;
+      total += v;
+    } else {
+      rounds[r] = null;
+    }
+  }
+  return {
+    id: a.id,
+    fullName: a.full_name,
+    competitorNumber: a.competitor_number,
+    country: a.country || "",
+    photo: a.photo || "",
+    status: a.status || "active",
+    eliminatedAfterRound: a.eliminated_after_round ?? null,
+    createdAt: a.created_at,
+    rounds,
+    total: Math.round(total * 10) / 10,
+  };
+}
+
+async function getSettings() {
+  const { rows } = await sql`SELECT current_round FROM settings WHERE id = 'main'`;
+  if (rows.length) return { currentRound: rows[0].current_round };
+  await sql`INSERT INTO settings (id, current_round) VALUES ('main', 0) ON CONFLICT (id) DO NOTHING`;
+  return { currentRound: 0 };
+}
+
+async function persistCurrentRound(r) {
+  await sql`UPDATE settings SET current_round = ${r} WHERE id = 'main'`;
+}
+
 // Real-time round progression. As soon as every still-active athlete has a
-// score for the next round, currentRound auto-advances and the elimination
-// for that round fires. Cascades — if the next round also has all scores,
-// it advances again, until it can't. Persists currentRound and elimination
-// state when changes occur.
-async function autoProgress(db) {
-  const settings = await getSettings(db);
-  let currentRound = settings.currentRound || 0;
-  const initialRound = currentRound;
-  let changed = false;
+// score for the next round, currentRound auto-advances and that round's
+// elimination fires. Cascades.
+async function autoProgress() {
+  const { currentRound: startRound } = await getSettings();
+  let currentRound = startRound;
 
   while (currentRound < TOTAL_ROUNDS) {
-    const athletes = await db.collection("athletes").find({}).toArray();
+    const { rows: athletes } = await sql`SELECT id, full_name, competitor_number, country, photo, status, eliminated_after_round FROM athletes`;
     const active = athletes.filter((a) => a.status !== "eliminated");
     if (active.length === 0) break;
 
     const nextRound = currentRound + 1;
-    const scoresForNext = await db
-      .collection("scores")
-      .find({ round: nextRound })
-      .toArray();
-    const scoredIds = new Set(scoresForNext.map((s) => s.athleteId));
+    const { rows: scoresForNext } = await sql`SELECT athlete_id FROM scores WHERE round = ${nextRound}`;
+    const scoredIds = new Set(scoresForNext.map((s) => s.athlete_id));
     if (!active.every((a) => scoredIds.has(a.id))) break;
 
     currentRound = nextRound;
-    changed = true;
 
     const target = eliminationsAfterRound(currentRound);
     const elimCount = athletes.length - active.length;
     const need = target - elimCount;
 
     if (need > 0) {
-      const allScores = await db.collection("scores").find({}).toArray();
-      const sba = {};
-      for (const s of allScores) {
-        if (!sba[s.athleteId]) sba[s.athleteId] = {};
-        sba[s.athleteId][s.round] = s.score;
-      }
-      const view = active.map((a) => {
-        const rounds = {};
-        let total = 0;
-        for (let r = 1; r <= TOTAL_ROUNDS; r++) {
-          const v = sba[a.id]?.[r];
-          if (typeof v === "number") {
-            rounds[r] = v;
-            total += v;
-          } else {
-            rounds[r] = null;
-          }
-        }
-        return {
-          ...a,
-          rounds,
-          total: Math.round(total * 10) / 10,
-        };
-      });
+      const { rows: allScores } = await sql`SELECT athlete_id, round, score FROM scores`;
+      const sba = buildScoresIndex(allScores);
+      const view = active.map((a) => athleteRow(a, sba));
       view.sort(compareForRank);
       const toEliminate = view.slice(view.length - need);
       for (const a of toEliminate) {
-        await db.collection("athletes").updateOne(
-          { id: a.id },
-          { $set: { status: "eliminated", eliminatedAfterRound: currentRound } }
-        );
+        await sql`UPDATE athletes SET status = 'eliminated', eliminated_after_round = ${currentRound} WHERE id = ${a.id}`;
       }
     }
   }
 
-  if (changed && currentRound !== initialRound) {
-    await persistSettings(db, { currentRound });
+  if (currentRound !== startRound) {
+    await persistCurrentRound(currentRound);
   }
 }
 
-async function recomputeRankings(db) {
-  // Real-time progression: auto-advance rounds and auto-eliminate before
-  // computing the public view, so the response always reflects up-to-date state.
-  await autoProgress(db);
+async function recomputeRankings() {
+  await autoProgress();
 
-  const settings = await getSettings(db);
-  const currentRound = settings.currentRound || 0;
-  const athletes = await db.collection("athletes").find({}).toArray();
-  const scores = await db.collection("scores").find({}).toArray();
+  const { currentRound } = await getSettings();
+  const { rows: athletes } = await sql`SELECT id, full_name, competitor_number, country, photo, status, eliminated_after_round, created_at FROM athletes`;
+  const { rows: scores } = await sql`SELECT athlete_id, round, score FROM scores`;
+  const sba = buildScoresIndex(scores);
 
-  const scoresByAthlete = {};
-  for (const s of scores) {
-    if (!scoresByAthlete[s.athleteId]) scoresByAthlete[s.athleteId] = {};
-    scoresByAthlete[s.athleteId][s.round] = s.score;
-  }
-
-  // Build view objects
-  let view = athletes.map((a) => {
-    const rounds = {};
-    let total = 0;
-    for (let r = 1; r <= TOTAL_ROUNDS; r++) {
-      const v = scoresByAthlete[a.id]?.[r];
-      if (typeof v === "number") {
-        rounds[r] = v;
-        total += v;
-      } else {
-        rounds[r] = null;
-      }
-    }
-    return {
-      id: a.id,
-      fullName: a.fullName,
-      competitorNumber: a.competitorNumber,
-      country: a.country || "",
-      photo: a.photo || "",
-      status: a.status || "active",
-      eliminatedAfterRound: a.eliminatedAfterRound ?? null,
-      createdAt: a.createdAt,
-      rounds,
-      total: Math.round(total * 10) / 10,
-    };
-  });
-
-  const active = view.filter((v) => v.status !== "eliminated");
-  const eliminated = view.filter((v) => v.status === "eliminated");
-
-  active.sort(compareForRank);
-
-  const target = eliminationsAfterRound(currentRound);
-  const needToEliminate = Math.max(0, target - eliminated.length);
-
-  if (needToEliminate > 0 && active.length > 0) {
-    // Eliminate lowest active athletes (last in sorted list)
-    const toEliminate = active.slice(active.length - needToEliminate);
-    for (const a of toEliminate) {
-      a.status = "eliminated";
-      a.eliminatedAfterRound = currentRound;
-      await db.collection("athletes").updateOne(
-        { id: a.id },
-        { $set: { status: "eliminated", eliminatedAfterRound: currentRound } }
-      );
-    }
-    const stillActive = active.slice(0, active.length - needToEliminate);
-    eliminated.push(...toEliminate);
-    active.length = 0;
-    active.push(...stillActive);
-  }
-
-  active.sort(compareForRank);
-  eliminated.sort((a, b) => {
+  const view = athletes.map((a) => athleteRow(a, sba));
+  const active = view.filter((v) => v.status !== "eliminated").slice().sort(compareForRank);
+  const eliminated = view.filter((v) => v.status === "eliminated").slice().sort((a, b) => {
     if ((b.eliminatedAfterRound ?? 0) !== (a.eliminatedAfterRound ?? 0)) {
       return (b.eliminatedAfterRound ?? 0) - (a.eliminatedAfterRound ?? 0);
     }
@@ -235,17 +170,13 @@ async function recomputeRankings(db) {
 
   let rank = 1;
   const ranked = [];
-  for (const a of active) {
-    ranked.push({ ...a, rank: rank++ });
-  }
-  for (const a of eliminated) {
-    ranked.push({ ...a, rank: rank++ });
-  }
+  for (const a of active) ranked.push({ ...a, rank: rank++ });
+  for (const a of eliminated) ranked.push({ ...a, rank: rank++ });
 
   return {
     athletes: ranked,
     currentRound,
-    elimsTarget: target,
+    elimsTarget: eliminationsAfterRound(currentRound),
     activeCount: active.length,
     totalAthletes: ranked.length,
     totalRounds: TOTAL_ROUNDS,
@@ -265,33 +196,31 @@ function validateScore(v) {
 async function dispatch(req, segments, method) {
   const path = "/" + segments.join("/");
 
-  // Auth: login (no token required). Needs the DB for the admins collection.
+  // Auth: login — needs DB schema ready
   if (path === "/auth/login" && method === "POST") {
     const body = await req.json().catch(() => ({}));
     const { username, password } = body || {};
     if (!username || !password) return err("Username and password required", 400);
-    const db = await getDb();
-    const user = await verifyCredentials(db, username, password);
+    await getSql(); // ensure schema before bootstrap
+    const user = await verifyCredentials(username, password);
     if (!user) return err("Invalid credentials", 401);
     const token = signToken(user);
     return json({ token, user: { username: user.username } });
   }
 
-  // All other routes require a valid JWT.
   const authedUser = requireAuth(req);
   if (!authedUser) return err("Unauthorized", 401);
 
-  // /auth/verify is the only authed route that does not need the DB.
   if (path === "/auth/verify" && method === "GET") {
     return json({ ok: true, user: { username: authedUser.username } });
   }
 
-  const db = await getDb();
+  // Every other authed route needs the schema.
+  await getSql();
 
   // STATE
   if (path === "/state" && method === "GET") {
-    const state = await recomputeRankings(db);
-    return json(state);
+    return json(await recomputeRankings());
   }
 
   // ATHLETES
@@ -299,53 +228,55 @@ async function dispatch(req, segments, method) {
     const body = await req.json().catch(() => ({}));
     const { fullName, competitorNumber, country, photo } = body || {};
     if (!fullName || typeof fullName !== "string") return err("fullName is required");
-    const numCount = await db.collection("athletes").countDocuments({});
-    if (numCount >= TOTAL_ATHLETES_MAX) return err(`Maximum ${TOTAL_ATHLETES_MAX} athletes allowed`);
+    const { rows: countRows } = await sql`SELECT COUNT(*)::int AS c FROM athletes`;
+    if (countRows[0].c >= TOTAL_ATHLETES_MAX) return err(`Maximum ${TOTAL_ATHLETES_MAX} athletes allowed`);
     const compNum = parseInt(competitorNumber, 10);
     if (!Number.isInteger(compNum) || compNum < 1 || compNum > TOTAL_ATHLETES_MAX) {
       return err(`competitorNumber must be 1..${TOTAL_ATHLETES_MAX}`);
     }
-    const dup = await db.collection("athletes").findOne({ competitorNumber: compNum });
-    if (dup) return err(`Competitor number ${compNum} already taken`);
-    const doc = {
-      id: uuidv4(),
-      fullName: fullName.trim(),
-      competitorNumber: compNum,
-      country: (country || "").trim(),
-      photo: (photo || "").trim(),
-      status: "active",
-      eliminatedAfterRound: null,
-      createdAt: new Date().toISOString(),
-    };
-    await db.collection("athletes").insertOne(doc);
-    return json(doc, 201);
+    const { rows: dup } = await sql`SELECT id FROM athletes WHERE competitor_number = ${compNum}`;
+    if (dup.length) return err(`Competitor number ${compNum} already taken`);
+    const id = uuidv4();
+    const fn = fullName.trim();
+    const co = (country || "").trim();
+    const ph = (photo || "").trim();
+    await sql`
+      INSERT INTO athletes (id, full_name, competitor_number, country, photo, status)
+      VALUES (${id}, ${fn}, ${compNum}, ${co}, ${ph}, 'active')
+    `;
+    return json({ id, fullName: fn, competitorNumber: compNum, country: co, photo: ph, status: "active" }, 201);
   }
 
   if (path.startsWith("/athletes/") && method === "PUT") {
     const id = segments[1];
     const body = await req.json().catch(() => ({}));
-    const patch = {};
-    if (typeof body.fullName === "string") patch.fullName = body.fullName.trim();
-    if (typeof body.country === "string") patch.country = body.country.trim();
-    if (typeof body.photo === "string") patch.photo = body.photo.trim();
+    // Apply each provided field with a separate UPDATE — keeps query simple
+    // for a 1-row admin op. The whole thing is sub-ms regardless.
+    if (typeof body.fullName === "string") {
+      await sql`UPDATE athletes SET full_name = ${body.fullName.trim()} WHERE id = ${id}`;
+    }
+    if (typeof body.country === "string") {
+      await sql`UPDATE athletes SET country = ${body.country.trim()} WHERE id = ${id}`;
+    }
+    if (typeof body.photo === "string") {
+      await sql`UPDATE athletes SET photo = ${body.photo.trim()} WHERE id = ${id}`;
+    }
     if (body.competitorNumber != null) {
       const n = parseInt(body.competitorNumber, 10);
       if (!Number.isInteger(n) || n < 1 || n > TOTAL_ATHLETES_MAX) {
         return err(`competitorNumber must be 1..${TOTAL_ATHLETES_MAX}`);
       }
-      const dup = await db.collection("athletes").findOne({ competitorNumber: n, id: { $ne: id } });
-      if (dup) return err(`Competitor number ${n} already taken`);
-      patch.competitorNumber = n;
+      const { rows: dup } = await sql`SELECT id FROM athletes WHERE competitor_number = ${n} AND id <> ${id}`;
+      if (dup.length) return err(`Competitor number ${n} already taken`);
+      await sql`UPDATE athletes SET competitor_number = ${n} WHERE id = ${id}`;
     }
-    const result = await db.collection("athletes").updateOne({ id }, { $set: patch });
-    if (result.matchedCount === 0) return err("Athlete not found", 404);
     return json({ ok: true });
   }
 
   if (path.startsWith("/athletes/") && method === "DELETE") {
     const id = segments[1];
-    await db.collection("athletes").deleteOne({ id });
-    await db.collection("scores").deleteMany({ athleteId: id });
+    // ON DELETE CASCADE on scores.athlete_id handles the scores rows.
+    await sql`DELETE FROM athletes WHERE id = ${id}`;
     return json({ ok: true });
   }
 
@@ -359,40 +290,35 @@ async function dispatch(req, segments, method) {
     }
     const score = validateScore(body.score);
     if (score === null) return err(`score must be a number ${SCORE_MIN}..${SCORE_MAX}`);
-    const athlete = await db.collection("athletes").findOne({ id: athleteId });
-    if (!athlete) return err("Athlete not found", 404);
-    if (athlete.status === "eliminated") return err("Cannot score an eliminated athlete");
-
-    await db.collection("scores").updateOne(
-      { athleteId, round: r },
-      { $set: { athleteId, round: r, score, updatedAt: new Date().toISOString() } },
-      { upsert: true }
-    );
+    const { rows: aRows } = await sql`SELECT id, status FROM athletes WHERE id = ${athleteId}`;
+    if (!aRows.length) return err("Athlete not found", 404);
+    if (aRows[0].status === "eliminated") return err("Cannot score an eliminated athlete");
+    await sql`
+      INSERT INTO scores (athlete_id, round, score, updated_at)
+      VALUES (${athleteId}, ${r}, ${score}, NOW())
+      ON CONFLICT (athlete_id, round)
+      DO UPDATE SET score = EXCLUDED.score, updated_at = NOW()
+    `;
     return json({ ok: true });
   }
 
-  // ROUNDS - advance
+  // ROUNDS
   if (path === "/rounds/advance" && method === "POST") {
-    const settings = await getSettings(db);
-    const current = settings.currentRound || 0;
+    const { currentRound: current } = await getSettings();
     if (current >= TOTAL_ROUNDS) return err("Already at the final round");
     const nextRound = current + 1;
-    // Validate all active athletes have a score for nextRound
-    const activeAthletes = await db.collection("athletes").find({ status: { $ne: "eliminated" } }).toArray();
-    if (activeAthletes.length === 0) return err("No active athletes to score");
-    const scoresForRound = await db.collection("scores").find({ round: nextRound }).toArray();
-    const scoredIds = new Set(scoresForRound.map((s) => s.athleteId));
-    const missing = activeAthletes.filter((a) => !scoredIds.has(a.id));
+    const { rows: actives } = await sql`SELECT id, full_name, competitor_number FROM athletes WHERE status <> 'eliminated'`;
+    if (actives.length === 0) return err("No active athletes to score");
+    const { rows: scoresForRound } = await sql`SELECT athlete_id FROM scores WHERE round = ${nextRound}`;
+    const scoredIds = new Set(scoresForRound.map((s) => s.athlete_id));
+    const missing = actives.filter((a) => !scoredIds.has(a.id));
     if (missing.length > 0) {
-      return err(
-        `Missing scores for round ${nextRound}`,
-        400,
-        { missing: missing.map((m) => ({ id: m.id, name: m.fullName, competitorNumber: m.competitorNumber })) }
-      );
+      return err(`Missing scores for round ${nextRound}`, 400, {
+        missing: missing.map((m) => ({ id: m.id, name: m.full_name, competitorNumber: m.competitor_number })),
+      });
     }
-    await persistSettings(db, { currentRound: nextRound });
-    const state = await recomputeRankings(db);
-    return json(state);
+    await persistCurrentRound(nextRound);
+    return json(await recomputeRankings());
   }
 
   if (path === "/rounds/set" && method === "POST") {
@@ -401,15 +327,14 @@ async function dispatch(req, segments, method) {
     if (!Number.isInteger(r) || r < 0 || r > TOTAL_ROUNDS) {
       return err(`round must be 0..${TOTAL_ROUNDS}`);
     }
-    await persistSettings(db, { currentRound: r });
-    const state = await recomputeRankings(db);
-    return json(state);
+    await persistCurrentRound(r);
+    return json(await recomputeRankings());
   }
 
   // SEED
   if (path === "/seed" && method === "POST") {
-    const existing = await db.collection("athletes").countDocuments({});
-    if (existing > 0) return err("Athletes already exist. Reset first.");
+    const { rows: countRows } = await sql`SELECT COUNT(*)::int AS c FROM athletes`;
+    if (countRows[0].c > 0) return err("Athletes already exist. Reset first.");
     const sample = [
       { fullName: "Anna Schmidt", country: "Germany" },
       { fullName: "James O'Connor", country: "Ireland" },
@@ -420,70 +345,71 @@ async function dispatch(req, segments, method) {
       { fullName: "Mateusz Kowalski", country: "Poland" },
       { fullName: "Sofia Rossi", country: "Italy" },
     ];
-    const docs = sample.map((s, i) => ({
-      id: uuidv4(),
-      fullName: s.fullName,
-      competitorNumber: i + 1,
-      country: s.country,
-      photo: "",
-      status: "active",
-      eliminatedAfterRound: null,
-      createdAt: new Date().toISOString(),
-    }));
-    await db.collection("athletes").insertMany(docs);
-    return json({ ok: true, count: docs.length });
+    for (let i = 0; i < sample.length; i++) {
+      const s = sample[i];
+      await sql`
+        INSERT INTO athletes (id, full_name, competitor_number, country, status)
+        VALUES (${uuidv4()}, ${s.fullName}, ${i + 1}, ${s.country}, 'active')
+      `;
+    }
+    return json({ ok: true, count: sample.length });
   }
 
-  // RESET
+  // RESET — archives current to competitions, then wipes athletes/scores/settings
   if (path === "/reset" && method === "POST") {
-    // Archive current competition first if any data exists
-    const athletes = await db.collection("athletes").find({}).toArray();
-    if (athletes.length > 0) {
-      const state = await recomputeRankings(db);
-      const settings = await getSettings(db);
+    const { rows: athletesRows } = await sql`SELECT id FROM athletes`;
+    if (athletesRows.length > 0) {
+      const state = await recomputeRankings();
       const body = await req.json().catch(() => ({}));
       const name = (body && typeof body.name === "string" && body.name.trim())
         || `Competition ${new Date().toISOString().slice(0, 10)}`;
-      await db.collection("competitions").insertOne({
-        id: uuidv4(),
-        name,
-        archivedAt: new Date().toISOString(),
-        currentRound: settings.currentRound || 0,
-        athletes: state.athletes,
-      });
+      await sql`
+        INSERT INTO competitions (id, name, current_round, athletes)
+        VALUES (${uuidv4()}, ${name}, ${state.currentRound}, ${JSON.stringify(state.athletes)}::jsonb)
+      `;
     }
-    await db.collection("athletes").deleteMany({});
-    await db.collection("scores").deleteMany({});
-    await db.collection("settings").updateOne({ _id: "main" }, { $set: { currentRound: 0 } }, { upsert: true });
+    await sql`DELETE FROM athletes`;
+    // scores are cascade-deleted; settings reset:
+    await persistCurrentRound(0);
     return json({ ok: true });
   }
 
   // COMPETITION HISTORY
   if (path === "/competitions" && method === "GET") {
-    const items = await db
-      .collection("competitions")
-      .find({}, { projection: { _id: 0 } })
-      .sort({ archivedAt: -1 })
-      .toArray();
+    const { rows } = await sql`SELECT id, name, archived_at, current_round, athletes FROM competitions ORDER BY archived_at DESC`;
+    const items = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      archivedAt: r.archived_at,
+      currentRound: r.current_round,
+      athletes: r.athletes,
+    }));
     return json({ items });
   }
 
   if (path.startsWith("/competitions/") && method === "GET") {
     const id = segments[1];
-    const item = await db.collection("competitions").findOne({ id }, { projection: { _id: 0 } });
-    if (!item) return err("Competition not found", 404);
-    return json(item);
+    const { rows } = await sql`SELECT id, name, archived_at, current_round, athletes FROM competitions WHERE id = ${id}`;
+    if (!rows.length) return err("Competition not found", 404);
+    const r = rows[0];
+    return json({
+      id: r.id,
+      name: r.name,
+      archivedAt: r.archived_at,
+      currentRound: r.current_round,
+      athletes: r.athletes,
+    });
   }
 
   if (path.startsWith("/competitions/") && method === "DELETE") {
     const id = segments[1];
-    await db.collection("competitions").deleteOne({ id });
+    await sql`DELETE FROM competitions WHERE id = ${id}`;
     return json({ ok: true });
   }
 
   // EXPORT CSV
   if (path === "/export/csv" && method === "GET") {
-    const state = await recomputeRankings(db);
+    const state = await recomputeRankings();
     const headers = [
       "Rank",
       "Competitor #",
@@ -493,16 +419,16 @@ async function dispatch(req, segments, method) {
       "Total",
       "Status",
     ];
+    const escape = (v) => {
+      const s = String(v ?? "");
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
     const rows = state.athletes.map((a) => {
       const roundCols = [];
       for (let r = 1; r <= TOTAL_ROUNDS; r++) {
         const v = a.rounds[r];
         roundCols.push(v == null ? "" : String(v));
       }
-      const escape = (v) => {
-        const s = String(v ?? "");
-        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-      };
       return [
         a.rank,
         String(a.competitorNumber).padStart(2, "0"),
@@ -525,7 +451,7 @@ async function dispatch(req, segments, method) {
   }
 
   if (path === "/export/xlsx" && method === "GET") {
-    const state = await recomputeRankings(db);
+    const state = await recomputeRankings();
     const ExcelJS = (await import("exceljs")).default;
     const wb = new ExcelJS.Workbook();
     wb.creator = "Rapid Stage Scoring System";
@@ -578,14 +504,13 @@ async function dispatch(req, segments, method) {
   }
 
   if (path === "/export/pdf" && method === "GET") {
-    const state = await recomputeRankings(db);
+    const state = await recomputeRankings();
     const PDFDocument = (await import("pdfkit")).default;
     const doc = new PDFDocument({ size: "A4", layout: "landscape", margin: 36 });
     const chunks = [];
     doc.on("data", (c) => chunks.push(c));
     const done = new Promise((resolve) => doc.on("end", resolve));
 
-    // Header
     doc.fillColor("#0a2540").rect(36, 36, doc.page.width - 72, 56).fill();
     doc.fillColor("#ffffff").font("Helvetica-Bold").fontSize(16).text("RAPID STAGE SCORING SYSTEM", 48, 50);
     doc.font("Helvetica").fontSize(10).text("Official Competition Results", 48, 72);
@@ -596,11 +521,10 @@ async function dispatch(req, segments, method) {
       .text(`Round ${state.currentRound} of ${TOTAL_ROUNDS} · ${state.activeCount} active · ${state.athletes.length - state.activeCount} eliminated`, 36, y);
     y += 22;
 
-    // Table headers
     const colX = [36, 70, 110, 230, 320];
     for (let r = 1; r <= TOTAL_ROUNDS; r++) colX.push(colX[colX.length - 1] + 32);
-    colX.push(colX[colX.length - 1] + 42); // Total
-    colX.push(colX[colX.length - 1] + 54); // Status
+    colX.push(colX[colX.length - 1] + 42);
+    colX.push(colX[colX.length - 1] + 54);
     const headers = ["#", "No.", "Athlete", "Country"];
     for (let r = 1; r <= TOTAL_ROUNDS; r++) headers.push(`R${r}`);
     headers.push("Total", "Status");
@@ -633,7 +557,6 @@ async function dispatch(req, segments, method) {
       }
     }
 
-    // Footer
     doc.fillColor("#94a3b8").font("Helvetica").fontSize(8)
       .text("Rapid Stage Scoring System · Internal Officiating Document", 36, doc.page.height - 30);
 
@@ -653,7 +576,8 @@ async function dispatch(req, segments, method) {
   return err("Not found", 404);
 }
 
-// Next.js handler exports
+// ---------- Next.js handlers ----------
+
 async function handle(req, ctx, method) {
   try {
     const params = await ctx.params;
