@@ -1161,7 +1161,31 @@ function App({ user, onLogout }) {
   const fetchState = useCallback(async () => {
     try {
       const s = await api("/state");
-      setState(s);
+      // Merge, don't blindly replace. The server is the source of truth, but
+      // if a cell is null on the server while we have a local value, that's an
+      // in-flight save that hasn't round-tripped yet — keep ours so a score
+      // never blinks out during a poll. (No "clear score" action exists, so the
+      // server never legitimately goes value -> null.)
+      setState((prev) => {
+        if (!prev) return s;
+        const prevById = new Map(prev.athletes.map((a) => [a.id, a]));
+        const athletes = s.athletes.map((a) => {
+          const old = prevById.get(a.id);
+          if (!old) return a;
+          let changed = false;
+          const rounds = { ...a.rounds };
+          let total = 0;
+          for (const k in rounds) {
+            if (rounds[k] == null && old.rounds[k] != null) {
+              rounds[k] = old.rounds[k];
+              changed = true;
+            }
+            if (typeof rounds[k] === "number") total += rounds[k];
+          }
+          return changed ? { ...a, rounds, total: Math.round(total * 10) / 10 } : a;
+        });
+        return { ...s, athletes };
+      });
     } catch (e) {
       if (e.message === "Unauthorized") onLogout();
       else toast.error(e.message);
@@ -1170,9 +1194,14 @@ function App({ user, onLogout }) {
 
   useEffect(() => { fetchState(); }, [fetchState]);
 
-  // No background polling — it was overwriting cells mid-edit and causing
-  // flicker. State refreshes only on deliberate actions: after a score saves
-  // (onScoreSaved) and when switching to a read tab (handleTabChange).
+  // Live multi-judge sync: poll every 2s so each scorer sees the others'
+  // entries. Safe now that (a) a focused cell is never overwritten mid-edit,
+  // (b) cells are memoized so only changed values repaint (no flicker), and
+  // (c) fetchState merges instead of clobbering in-flight local saves.
+  useEffect(() => {
+    const id = setInterval(() => { fetchState(); }, 2000);
+    return () => clearInterval(id);
+  }, [fetchState]);
 
   // Apply a saved score to local state instead of refetching the whole
   // competition. The old refetch replaced the entire state object on every
