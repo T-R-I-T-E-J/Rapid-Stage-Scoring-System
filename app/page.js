@@ -1319,7 +1319,7 @@ function App({ user, onLogout }) {
               <Shield className="h-5 w-5" />
             </div>
             <div>
-              <div className="text-sm font-semibold tracking-wide">Rapid Stage Scoring System</div>
+              <div className="text-sm font-semibold tracking-wide">Scoring System</div>
               <div className="text-[11px] text-white/60 uppercase tracking-wider">Officiating · Internal</div>
             </div>
           </div>
