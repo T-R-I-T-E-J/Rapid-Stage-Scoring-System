@@ -224,11 +224,16 @@ function ScoreCell({ athleteId, round, value, disabled, onSaved, registerInput }
   );
 
   function onChange(e) {
-    // Update the field only — do NOT save mid-typing. Saving on a debounce
-    // timer was persisting partial values ("8" before "8.4" finished) and
-    // flashing them back into the cell. We save on blur / Enter instead,
-    // when the full value is entered.
-    setVal(e.target.value);
+    const v = e.target.value;
+    setVal(v);
+    // Autosave shortly after typing stops. Mobile users often type a value and
+    // never blur the field, so blur/Enter alone left their scores uncommitted
+    // (the number sat in the box looking saved but never reached the server,
+    // so other devices never saw it). 800ms is long enough to finish a 2-4
+    // char score before it fires, so we don't persist partials; the focus
+    // guard + memoized cells keep the field stable while it saves.
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => save(v), 800);
   }
 
   function onBlur() {
@@ -499,11 +504,16 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
   );
 
   function onChange(e) {
-    // Update the field only — do NOT save mid-typing. Saving on a debounce
-    // timer was persisting partial values ("8" before "8.4" finished) and
-    // flashing them back into the cell. We save on blur / Enter instead,
-    // when the full value is entered.
-    setVal(e.target.value);
+    const v = e.target.value;
+    setVal(v);
+    // Autosave shortly after typing stops. Mobile users often type a value and
+    // never blur the field, so blur/Enter alone left their scores uncommitted
+    // (the number sat in the box looking saved but never reached the server,
+    // so other devices never saw it). 800ms is long enough to finish a 2-4
+    // char score before it fires, so we don't persist partials; the focus
+    // guard + memoized cells keep the field stable while it saves.
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => save(v), 800);
   }
 
   function onBlur() {
