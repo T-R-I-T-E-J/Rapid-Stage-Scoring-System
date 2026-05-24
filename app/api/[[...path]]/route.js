@@ -12,9 +12,9 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const TOTAL_ATHLETES_MAX = 8;
-const TOTAL_ROUNDS = 10;
+const TOTAL_ROUNDS = 24;
 const SCORE_MIN = 0;
-const SCORE_MAX = 5;
+const SCORE_MAX = 100;
 
 // ---------- helpers ----------
 
@@ -24,11 +24,6 @@ function json(data, status = 200) {
 
 function err(message, status = 400, extra = {}) {
   return NextResponse.json({ error: message, ...extra }, { status });
-}
-
-function eliminationsAfterRound(r) {
-  if (r < 4) return 0;
-  return Math.min(6, r - 3);
 }
 
 function requireAuth(req) {
@@ -111,15 +106,15 @@ async function persistCurrentRound(r) {
   await sql`UPDATE settings SET current_round = ${r} WHERE id = 'main'`;
 }
 
-// Real-time round progression. As soon as every still-active athlete has a
-// score for the next round, currentRound auto-advances and that round's
-// elimination fires. Cascades.
+// Real-time round progression. As soon as every still-active shooter has a
+// score for the next shot, currentRound auto-advances. Eliminations are now
+// manual only (see POST /athletes/:id/eliminate), so no eliminations fire here.
 async function autoProgress() {
   const { currentRound: startRound } = await getSettings();
   let currentRound = startRound;
 
   while (currentRound < TOTAL_ROUNDS) {
-    const { rows: athletes } = await sql`SELECT id, full_name, competitor_number, country, photo, status, eliminated_after_round FROM athletes`;
+    const { rows: athletes } = await sql`SELECT id, status FROM athletes`;
     const active = athletes.filter((a) => a.status !== "eliminated");
     if (active.length === 0) break;
 
@@ -129,21 +124,6 @@ async function autoProgress() {
     if (!active.every((a) => scoredIds.has(a.id))) break;
 
     currentRound = nextRound;
-
-    const target = eliminationsAfterRound(currentRound);
-    const elimCount = athletes.length - active.length;
-    const need = target - elimCount;
-
-    if (need > 0) {
-      const { rows: allScores } = await sql`SELECT athlete_id, round, score FROM scores`;
-      const sba = buildScoresIndex(allScores);
-      const view = active.map((a) => athleteRow(a, sba));
-      view.sort(compareForRank);
-      const toEliminate = view.slice(view.length - need);
-      for (const a of toEliminate) {
-        await sql`UPDATE athletes SET status = 'eliminated', eliminated_after_round = ${currentRound} WHERE id = ${a.id}`;
-      }
-    }
   }
 
   if (currentRound !== startRound) {
@@ -176,7 +156,6 @@ async function recomputeRankings() {
   return {
     athletes: ranked,
     currentRound,
-    elimsTarget: eliminationsAfterRound(currentRound),
     activeCount: active.length,
     totalAthletes: ranked.length,
     totalRounds: TOTAL_ROUNDS,
@@ -273,6 +252,28 @@ async function dispatch(req, segments, method) {
     return json({ ok: true });
   }
 
+  // Manual elimination — one-way. Marks the selected shooter eliminated and
+  // records the shot/round they were eliminated after (the current round).
+  if (path.startsWith("/athletes/") && segments[2] === "eliminate" && method === "POST") {
+    const id = segments[1];
+    const { rows: aRows } = await sql`SELECT id, status FROM athletes WHERE id = ${id}`;
+    if (!aRows.length) return err("Athlete not found", 404);
+    if (aRows[0].status === "eliminated") return err("Athlete is already eliminated");
+    const { currentRound } = await getSettings();
+    await sql`UPDATE athletes SET status = 'eliminated', eliminated_after_round = ${currentRound} WHERE id = ${id}`;
+    return json(await recomputeRankings());
+  }
+
+  // Reinstate — the other half of the toggle. Returns a shooter to active and
+  // clears their elimination round. Their recorded scores are untouched.
+  if (path.startsWith("/athletes/") && segments[2] === "reinstate" && method === "POST") {
+    const id = segments[1];
+    const { rows: aRows } = await sql`SELECT id FROM athletes WHERE id = ${id}`;
+    if (!aRows.length) return err("Athlete not found", 404);
+    await sql`UPDATE athletes SET status = 'active', eliminated_after_round = NULL WHERE id = ${id}`;
+    return json(await recomputeRankings());
+  }
+
   if (path.startsWith("/athletes/") && method === "DELETE") {
     const id = segments[1];
     // ON DELETE CASCADE on scores.athlete_id handles the scores rows.
@@ -331,28 +332,31 @@ async function dispatch(req, segments, method) {
     return json(await recomputeRankings());
   }
 
-  // SEED
+  // SEED — loads the competition roster. Idempotent and non-destructive:
+  // adds any shooter whose competitor number isn't taken yet, leaving existing
+  // athletes and their scores untouched. Safe to click mid-competition.
   if (path === "/seed" && method === "POST") {
-    const { rows: countRows } = await sql`SELECT COUNT(*)::int AS c FROM athletes`;
-    if (countRows[0].c > 0) return err("Athletes already exist. Reset first.");
     const sample = [
-      { fullName: "Anna Schmidt", country: "Germany" },
-      { fullName: "James O'Connor", country: "Ireland" },
-      { fullName: "Priya Sharma", country: "India" },
-      { fullName: "Lucas Pereira", country: "Brazil" },
-      { fullName: "Yuki Tanaka", country: "Japan" },
-      { fullName: "Olivia Carter", country: "United Kingdom" },
-      { fullName: "Mateusz Kowalski", country: "Poland" },
-      { fullName: "Sofia Rossi", country: "Italy" },
+      { fullName: "Sanjeev Giri", country: "TN" },
+      { fullName: "Manish Narwal", country: "HAR" },
+      { fullName: "Rudransh Khandelwal", country: "RAJ" },
+      { fullName: "Amir Ahmad Bhat", country: "Army" },
+      { fullName: "Santosh Vithoda Gadhe", country: "MAH" },
+      { fullName: "Shivraj Sankhala", country: "RAJ" },
+      { fullName: "Akash", country: "UP" },
+      { fullName: "Ajay Kumar", country: "BIH" },
     ];
+    let inserted = 0;
     for (let i = 0; i < sample.length; i++) {
       const s = sample[i];
-      await sql`
+      const { rowCount } = await sql`
         INSERT INTO athletes (id, full_name, competitor_number, country, status)
         VALUES (${uuidv4()}, ${s.fullName}, ${i + 1}, ${s.country}, 'active')
+        ON CONFLICT (competitor_number) DO NOTHING
       `;
+      inserted += rowCount || 0;
     }
-    return json({ ok: true, count: sample.length });
+    return json({ ok: true, count: inserted });
   }
 
   // RESET — archives current to competitions, then wipes athletes/scores/settings

@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: main
+    # No host port: the app talks to Postgres via the neon-proxy (4444),
+    # and another local Postgres already owns host 5432.
+    volumes:
+      - rsss_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d main"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # Emulates Neon's HTTP/WebSocket SQL endpoint so @vercel/postgres works offline.
+  neon-proxy:
+    image: ghcr.io/timowilhelm/local-neon-http-proxy:main
+    restart: unless-stopped
+    environment:
+      PG_CONNECTION_STRING: postgres://postgres:postgres@db:5432/main
+    ports:
+      - "4444:4444"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  rsss_pgdata:

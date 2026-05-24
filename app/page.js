@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Shield,
@@ -18,6 +18,8 @@ import {
   Plus,
   Pencil,
   Trash2,
+  UserX,
+  UserCheck,
   Archive,
   History,
   Eye,
@@ -46,8 +48,9 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Separator } from "@/components/ui/separator";
 
 const TOKEN_KEY = "rss_token";
-const TOTAL_ROUNDS = 10;
+const TOTAL_ROUNDS = 24;
 const MAX_ATHLETES = 8;
+const SCORE_MAX = 100;
 
 // ---------- API client ----------
 
@@ -196,9 +199,9 @@ function ScoreCell({ athleteId, round, value, disabled, onSaved, registerInput }
     async (raw) => {
       if (raw === "" || raw == null) return;
       const n = Number(raw);
-      if (Number.isNaN(n) || n < 0 || n > 5) {
+      if (Number.isNaN(n) || n < 0 || n > SCORE_MAX) {
         setErrored(true);
-        toast.error(`Score for R${round} must be 0-5`);
+        toast.error(`Score for R${round} must be 0-${SCORE_MAX}`);
         return;
       }
       setSaving(true);
@@ -221,10 +224,11 @@ function ScoreCell({ athleteId, round, value, disabled, onSaved, registerInput }
   );
 
   function onChange(e) {
-    const v = e.target.value;
-    setVal(v);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => save(v), 400);
+    // Update the field only — do NOT save mid-typing. Saving on a debounce
+    // timer was persisting partial values ("8" before "8.4" finished) and
+    // flashing them back into the cell. We save on blur / Enter instead,
+    // when the full value is entered.
+    setVal(e.target.value);
   }
 
   function onBlur() {
@@ -251,7 +255,7 @@ function ScoreCell({ athleteId, round, value, disabled, onSaved, registerInput }
       ref={inputRef}
       type="number"
       min={0}
-      max={5}
+      max={SCORE_MAX}
       step={0.1}
       inputMode="decimal"
       value={val}
@@ -273,7 +277,26 @@ function ScoreCell({ athleteId, round, value, disabled, onSaved, registerInput }
 
 // ---------- Score Grid ----------
 
-function ScoreGrid({ state, onScoreSaved }) {
+function ScoreGrid({ state, onScoreSaved, onMutated }) {
+  // Eliminate / reinstate toggle, available right in the scoring grid so the
+  // judge never has to leave Score Entry. Refetches full state after (this is
+  // an occasional action, not per-keystroke, so a refetch is fine here).
+  async function toggleElim(a) {
+    try {
+      if (a.status === "eliminated") {
+        await api(`/athletes/${a.id}/reinstate`, { method: "POST" });
+        toast.success(`${a.fullName} reinstated`);
+      } else {
+        if (!confirm(`Eliminate ${a.fullName}? They keep their recorded scores but can no longer be scored (you can reinstate them).`)) return;
+        await api(`/athletes/${a.id}/eliminate`, { method: "POST" });
+        toast.success(`${a.fullName} eliminated`);
+      }
+      onMutated?.();
+    } catch (e) {
+      toast.error(e.message);
+    }
+  }
+
   // We expose a "next" pointer between athletes for Enter key navigation:
   // input[data-rss-next-of="<currentAthleteId>"] points to next athlete same round.
   const orderedAthletes = useMemo(
@@ -297,10 +320,10 @@ function ScoreGrid({ state, onScoreSaved }) {
         <div className="flex items-center justify-between">
           <div>
             <CardTitle className="text-base font-semibold text-slate-900">
-              Score Entry · Rounds 1–10
+              Score Entry · Series 1–{TOTAL_ROUNDS}
             </CardTitle>
             <CardDescription className="text-xs text-slate-500">
-              Range 0.0 – 5.0 · Autosaves on change · Enter moves to next athlete in same round
+              Range 0.0 – {SCORE_MAX.toFixed(1)} · Autosaves on change · Enter moves to next shooter in same series
             </CardDescription>
           </div>
           <Badge variant="outline" className="text-[11px] uppercase tracking-wider">
@@ -340,6 +363,19 @@ function ScoreGrid({ state, onScoreSaved }) {
                   </td>
                   <td className="px-3 py-2">
                     <div className="flex items-center gap-2">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => toggleElim(a)}
+                        title={isElim ? "Reinstate shooter" : "Eliminate shooter"}
+                        className={
+                          isElim
+                            ? "h-7 w-7 shrink-0 text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50"
+                            : "h-7 w-7 shrink-0 text-amber-600 hover:text-amber-700 hover:bg-amber-50"
+                        }
+                      >
+                        {isElim ? <UserCheck className="h-4 w-4" /> : <UserX className="h-4 w-4" />}
+                      </Button>
                       <span className="font-medium text-slate-900">{a.fullName}</span>
                       {isElim && (
                         <Badge variant="destructive" className="text-[10px] uppercase">
@@ -390,7 +426,7 @@ function ScoreGrid({ state, onScoreSaved }) {
             })}
             {orderedAthletes.length === 0 && (
               <tr>
-                <td colSpan={14} className="px-3 py-8 text-center text-slate-500 text-sm">
+                <td colSpan={TOTAL_ROUNDS + 4} className="px-3 py-8 text-center text-slate-500 text-sm">
                   No athletes registered. Switch to the Athletes tab to add them or load the sample roster.
                 </td>
               </tr>
@@ -402,7 +438,7 @@ function ScoreGrid({ state, onScoreSaved }) {
   );
 }
 
-function ScoreCellWrapper({ athleteId, round, value, disabled, onSaved, nextAthleteId }) {
+const ScoreCellWrapper = memo(function ScoreCellWrapper({ athleteId, round, value, disabled, onSaved, nextAthleteId }) {
   // Attach a stable data attribute pointer for Enter-key navigation by querying
   // `input[data-rss-round=R][data-rss-next-of=athleteId]` for the next input.
   // We render two inputs would be wasteful, so just render one input then add
@@ -413,7 +449,7 @@ function ScoreCellWrapper({ athleteId, round, value, disabled, onSaved, nextAthl
   // and have ScoreCell find input where data-rss-athlete === nextAthleteId AND round === round.
 
   return <ScoreCellWithNav athleteId={athleteId} round={round} value={value} disabled={disabled} onSaved={onSaved} />;
-}
+});
 
 function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
   // Wraps ScoreCell but overrides Enter behavior to find next athlete in same round.
@@ -425,6 +461,11 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
   const lastSavedRef = useRef(value == null ? "" : String(value));
 
   useEffect(() => {
+    // Never overwrite the field while the judge is editing it — the post-save
+    // refetch would otherwise snap the value back (and jump the cursor),
+    // making decimal entry impossible. Only sync from the server when this
+    // cell is NOT focused.
+    if (typeof document !== "undefined" && document.activeElement === inputRef.current) return;
     setVal(value == null ? "" : String(value));
     lastSavedRef.current = value == null ? "" : String(value);
   }, [value]);
@@ -433,9 +474,9 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
     async (raw) => {
       if (raw === "" || raw == null) return;
       const n = Number(raw);
-      if (Number.isNaN(n) || n < 0 || n > 5) {
+      if (Number.isNaN(n) || n < 0 || n > SCORE_MAX) {
         setErrored(true);
-        toast.error(`Score for R${round} must be 0-5`);
+        toast.error(`Score for R${round} must be 0-${SCORE_MAX}`);
         return;
       }
       setSaving(true);
@@ -446,7 +487,7 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
           body: JSON.stringify({ athleteId, round, score: n }),
         });
         lastSavedRef.current = String(n);
-        onSaved?.();
+        onSaved?.(athleteId, round, n);
       } catch (e) {
         setErrored(true);
         toast.error(e.message || "Save failed");
@@ -458,10 +499,11 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
   );
 
   function onChange(e) {
-    const v = e.target.value;
-    setVal(v);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => save(v), 400);
+    // Update the field only — do NOT save mid-typing. Saving on a debounce
+    // timer was persisting partial values ("8" before "8.4" finished) and
+    // flashing them back into the cell. We save on blur / Enter instead,
+    // when the full value is entered.
+    setVal(e.target.value);
   }
 
   function onBlur() {
@@ -494,7 +536,7 @@ function ScoreCellWithNav({ athleteId, round, value, disabled, onSaved }) {
       ref={inputRef}
       type="number"
       min={0}
-      max={5}
+      max={SCORE_MAX}
       step={0.1}
       inputMode="decimal"
       value={val}
@@ -710,10 +752,31 @@ function AthletesPanel({ state, onMutated }) {
     }
   }
 
+  async function eliminate(a) {
+    if (!confirm(`Eliminate ${a.fullName}? They keep their recorded scores but can no longer be scored (you can reinstate them).`)) return;
+    try {
+      await api(`/athletes/${a.id}/eliminate`, { method: "POST" });
+      toast.success(`${a.fullName} eliminated`);
+      onMutated?.();
+    } catch (e) {
+      toast.error(e.message);
+    }
+  }
+
+  async function reinstate(a) {
+    try {
+      await api(`/athletes/${a.id}/reinstate`, { method: "POST" });
+      toast.success(`${a.fullName} reinstated`);
+      onMutated?.();
+    } catch (e) {
+      toast.error(e.message);
+    }
+  }
+
   async function seed() {
     try {
-      await api("/seed", { method: "POST" });
-      toast.success("Loaded 8 sample athletes");
+      const r = await api("/seed", { method: "POST" });
+      toast.success(r?.count ? `Added ${r.count} shooter(s)` : "Roster already loaded");
       onMutated?.();
     } catch (e) {
       toast.error(e.message);
@@ -731,9 +794,9 @@ function AthletesPanel({ state, onMutated }) {
             </CardDescription>
           </div>
           <div className="flex items-center gap-2">
-            {ordered.length === 0 && (
+            {ordered.length < MAX_ATHLETES && (
               <Button size="sm" variant="outline" onClick={seed}>
-                Load Sample Roster
+                Load Roster
               </Button>
             )}
             <Button
@@ -783,6 +846,27 @@ function AthletesPanel({ state, onMutated }) {
                     <Button size="icon" variant="ghost" onClick={() => openEdit(a)}>
                       <Pencil className="h-4 w-4" />
                     </Button>
+                    {a.status === "eliminated" ? (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => reinstate(a)}
+                        title="Reinstate shooter"
+                        className="text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50"
+                      >
+                        <UserCheck className="h-4 w-4" />
+                      </Button>
+                    ) : (
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => eliminate(a)}
+                        title="Eliminate shooter"
+                        className="text-amber-600 hover:text-amber-700 hover:bg-amber-50"
+                      >
+                        <UserX className="h-4 w-4" />
+                      </Button>
+                    )}
                     <Button
                       size="icon"
                       variant="ghost"
@@ -883,7 +967,7 @@ function FinalStandings({ state }) {
       <CardContent className="p-6">
         {podium.length < 3 ? (
           <p className="text-sm text-slate-500">
-            Podium will populate as athletes are eliminated. Currently {podium.length} ranked.
+            Podium populates once at least 3 shooters are registered. Currently {podium.length} ranked.
           </p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1086,19 +1170,31 @@ function App({ user, onLogout }) {
 
   useEffect(() => { fetchState(); }, [fetchState]);
 
-  // Live polling — keeps Rankings + every other tab fresh even when score
-  // entry happens in another browser window or score saves race the UI.
-  // 3s is fast enough for live officiating, cheap enough on the server.
-  useEffect(() => {
-    const id = setInterval(() => { fetchState(); }, 3000);
-    return () => clearInterval(id);
-  }, [fetchState]);
+  // No background polling — it was overwriting cells mid-edit and causing
+  // flicker. State refreshes only on deliberate actions: after a score saves
+  // (onScoreSaved) and when switching to a read tab (handleTabChange).
 
-  const onScoreSaved = useCallback(async () => {
-    setRefreshing(true);
-    await fetchState();
-    setRefreshing(false);
-  }, [fetchState]);
+  // Apply a saved score to local state instead of refetching the whole
+  // competition. The old refetch replaced the entire state object on every
+  // keystroke-save, re-rendering all 192 cells — that full-grid repaint is
+  // what looked like a page "reload" when you pressed Enter. Authoritative
+  // ranks / current round still refresh when you switch to a read tab.
+  const onScoreSaved = useCallback((athleteId, round, score) => {
+    setState((prev) => {
+      if (!prev) return prev;
+      const athletes = prev.athletes.map((a) => {
+        if (a.id !== athleteId) return a;
+        const rounds = { ...a.rounds, [round]: score };
+        let total = 0;
+        for (const k in rounds) {
+          const v = rounds[k];
+          if (typeof v === "number") total += v;
+        }
+        return { ...a, rounds, total: Math.round(total * 10) / 10 };
+      });
+      return { ...prev, athletes };
+    });
+  }, []);
 
   // Instant refresh whenever the user switches to a read-mostly tab.
   const handleTabChange = useCallback((v) => {
@@ -1237,7 +1333,7 @@ function App({ user, onLogout }) {
           <CardContent className="p-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] uppercase tracking-wider text-slate-500 mr-2">Jump to round:</span>
+                <span className="text-[11px] uppercase tracking-wider text-slate-500 mr-2">Jump to series:</span>
                 {Array.from({ length: TOTAL_ROUNDS }, (_, i) => {
                   const r = i + 1;
                   const active = state.currentRound === r;
@@ -1322,7 +1418,7 @@ function App({ user, onLogout }) {
           </TabsList>
 
           <TabsContent value="scores">
-            <ScoreGrid state={state} onScoreSaved={onScoreSaved} />
+            <ScoreGrid state={state} onScoreSaved={onScoreSaved} onMutated={fetchState} />
           </TabsContent>
           <TabsContent value="rankings">
             <Rankings state={state} />
